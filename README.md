@@ -1,4 +1,6 @@
-# House Price Prediction System
+# AI-Powered Real Estate Intelligence, Valuation &amp; Investment Recommendation
+
+Platform
 
 ## Project Overview
 This project builds a **House Price Prediction System** using machine learning and an interactive dashboard.  
