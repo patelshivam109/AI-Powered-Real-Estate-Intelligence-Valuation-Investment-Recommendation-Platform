@@ -217,6 +217,16 @@ X_TEST_FILE = BASE_DIR / "models" / "X_test_log.csv"
 Y_TEST_FILE = BASE_DIR / "models" / "y_test_log.csv"
 DATA_FILE = BASE_DIR / "data" / "processed" / "house_price_final.csv"
 FALLBACK_DATA_FILE = BASE_DIR / "data" / "processed" / "house_price_with_risk_recommendation.csv"
+INDIAN_MARKET_BASE_MULTIPLIER = 16.0
+
+def calculate_market_multiplier(dataframe):
+    postal_avg = dataframe.groupby("Postal Code")["Price"].transform("mean")
+    postal_rank = postal_avg.rank(pct=True)
+    location_factor = 0.85 + (postal_rank * 0.55)
+    grade_factor = 1 + ((dataframe["grade"] - 7).clip(-4, 6) * 0.035)
+    infrastructure_factor = 1 + ((dataframe["amenity_score"] - dataframe["amenity_score"].median()).clip(-0.4, 0.4) * 0.18)
+    premium_factor = 1 + (dataframe["gated"].fillna(0).clip(0, 1) * 0.06)
+    return (INDIAN_MARKET_BASE_MULTIPLIER * location_factor * grade_factor * infrastructure_factor * premium_factor).clip(10, 28)
 
 @st.cache_resource
 def load_catboost_model():
@@ -255,7 +265,7 @@ def load_data():
         "Forecast_3Y": "forecast_3y",
         "Forecast_5Y": "forecast_5y",
     })
-    df["price"] = df["Price"]
+    df["raw_price"] = df["Price"]
     df["risk_score"] = df["Risk_Score"]
     df["recommendation"] = df["Recommendation"]
     df["city"] = "Pincode " + df["Postal Code"].astype(str)
@@ -272,11 +282,19 @@ def load_data():
     if "investment_score" not in df.columns:
         df["investment_score"] = np.nan
     if "forecast_1y" not in df.columns:
-        df["forecast_1y"] = df["price"] * 1.05
+        df["forecast_1y"] = df["raw_price"] * 1.05
     if "forecast_3y" not in df.columns:
-        df["forecast_3y"] = df["price"] * (1.05 ** 3)
+        df["forecast_3y"] = df["raw_price"] * (1.05 ** 3)
     if "forecast_5y" not in df.columns:
-        df["forecast_5y"] = df["price"] * (1.05 ** 5)
+        df["forecast_5y"] = df["raw_price"] * (1.05 ** 5)
+    df["raw_forecast_1y"] = df["forecast_1y"]
+    df["raw_forecast_3y"] = df["forecast_3y"]
+    df["raw_forecast_5y"] = df["forecast_5y"]
+    df["market_multiplier"] = calculate_market_multiplier(df)
+    df["price"] = df["raw_price"] * df["market_multiplier"]
+    df["forecast_1y"] = df["raw_forecast_1y"] * df["market_multiplier"]
+    df["forecast_3y"] = df["raw_forecast_3y"] * df["market_multiplier"]
+    df["forecast_5y"] = df["raw_forecast_5y"] * df["market_multiplier"]
     return df
 
 @st.cache_resource
@@ -462,12 +480,25 @@ def prepare_model_matrix(input_df, feature_columns):
         model_df["Infrastructure_Score"] = model_df["Infrastructure_Score"] / 10.0
     return model_df[feature_columns], missing
 
+def estimate_market_multiplier(model_df):
+    postal_multiplier = df.groupby("Postal Code")["market_multiplier"].median()
+    multiplier = model_df["Postal Code"].map(postal_multiplier)
+    quality_multiplier = (
+        INDIAN_MARKET_BASE_MULTIPLIER *
+        (1 + ((model_df["grade of the house"] - 7).clip(-4, 6) * 0.035)) *
+        (1 + ((model_df["Infrastructure_Score"] - 0.55).clip(-0.4, 0.4) * 0.18)) *
+        (1 + (model_df["waterfront present"].fillna(0).clip(0, 1) * 0.06))
+    )
+    return multiplier.fillna(quality_multiplier).clip(10, 30)
+
 def score_uploaded_properties(input_df):
     model = load_catboost_model()
     X_test, _ = load_test_data()
     model_df, missing = prepare_model_matrix(input_df, X_test.columns)
     scored = input_df.copy()
-    scored["Predicted Price"] = np.expm1(model.predict(model_df))
+    scored["Original Model Price"] = np.expm1(model.predict(model_df))
+    scored["Market Calibration"] = estimate_market_multiplier(model_df)
+    scored["Predicted Price"] = scored["Original Model Price"] * scored["Market Calibration"]
     condition_risk = ((5 - model_df["condition of the house"]) / 4).clip(0, 1)
     age_risk = (model_df["Property_Age"] / max(1, df["age"].max())).clip(0, 1)
     grade_risk = ((13 - model_df["grade of the house"]) / 10).clip(0, 1)
@@ -620,7 +651,7 @@ if page == pages[0]:
     section_header("EXECUTIVE SUMMARY", "Platform Capabilities & Intelligence")
     cols = st.columns(3)
     caps = [
-        ("💰", "Price Prediction", f"CatBoost regressor trained on {len(df):,} Indian properties. Estimated accuracy within ±9% of market value."),
+        ("💰", "Price Prediction", f"CatBoost trained on the original {len(df):,}-record dataset, with an Indian market calibration layer for current dashboard prices."),
         ("⚠️", "Risk Assessment", "Composite scoring across age, condition, airport access, and neighbourhood market volatility."),
         ("📈", "Investment Engine", "ML-backed BUY / HOLD / SELL signals calibrated to Indian market cycles and RERA compliance."),
         ("🔮", "Price Forecasting", "Multi-horizon forecasts (1Y / 3Y / 5Y) benchmarked against RBI repo rate trends and city-level demand."),
@@ -714,6 +745,10 @@ elif page == pages[1]:
 elif page == pages[2]:
     section_header("ML ENGINE", "Property Price Prediction",
                    "Enter property details to get an AI-generated market valuation in Indian Rupees.")
+    insight("""<strong>Calibration Note:</strong> The CatBoost model is trained on the original collected dataset.
+    For dashboard realism, a transparent Indian market calibration sub-layer adjusts the model output using pincode,
+    construction grade, infrastructure score, and premium-location signals. The ML training stays unchanged; the final
+    shown value reflects current-market interpretation.""")
 
     with st.form("predict_form"):
         c1, c2, c3 = st.columns(3)
@@ -779,7 +814,15 @@ elif page == pages[2]:
         pred_row = pred_row[X_test.columns]
 
         pred_log = float(model.predict(pred_row)[0])
-        pred = float(np.expm1(pred_log))
+        raw_pred = float(np.expm1(pred_log))
+        base_multiplier = estimate_market_multiplier(pred_row).iloc[0]
+        if not market_df.empty:
+            grade_adjust = 1 + ((grade - market_df["grade"].median()) * 0.025)
+            infra_adjust = 1 + (((amenity / 10.0) - (market_df["amenity_score"].median() / 10.0)) * 0.12)
+            market_multiplier = float(np.clip(base_multiplier * grade_adjust * infra_adjust, 10, 30))
+        else:
+            market_multiplier = float(base_multiplier)
+        pred = raw_pred * market_multiplier
         low  = pred * 0.91
         high = pred * 1.09
 
@@ -800,11 +843,11 @@ elif page == pages[2]:
         with col_res:
             st.markdown(f"""
             <div class="predict-card">
-              <div class="predict-label">Predicted Market Value</div>
+              <div class="predict-label">Calibrated Indian Market Value</div>
               <div class="predict-value">{fmt_inr(pred)}</div>
               <div class="predict-sub">Confidence Range: {fmt_inr(low)} – {fmt_inr(high)}</div>
               <div style="font-size:13px;color:rgba(255,255,255,.55);margin-top:8px;">{fmt_inr_full(int(pred))}</div>
-              <div class="predict-badge">🤖 CatBoost · SHAP explainability · {city_sel} estimate</div>
+              <div class="predict-badge">🤖 CatBoost base {fmt_inr(raw_pred)} · market layer ×{market_multiplier:.1f}</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -838,8 +881,10 @@ elif page == pages[2]:
                 showlegend=False)
             st.plotly_chart(fig_break, use_container_width=True)
 
-        insight(f"""<strong>Valuation Summary:</strong> The CatBoost model produced a log-price prediction of <strong>{pred_log:.4f}</strong>, returning an estimated property value of <strong>{fmt_inr(pred)}</strong>.
-        The bar chart shows the top SHAP drivers for this input, where positive values increase the predicted log-price and negative values decrease it.""")
+        insight(f"""<strong>Valuation Summary:</strong> The trained CatBoost model produced a log-price prediction of <strong>{pred_log:.4f}</strong>,
+        equal to an original model estimate of <strong>{fmt_inr(raw_pred)}</strong>. The Indian market calibration layer then applied a <strong>{market_multiplier:.1f}×</strong>
+        multiplier based on selected pincode, grade, and infrastructure inputs, returning <strong>{fmt_inr(pred)}</strong>.
+        The SHAP chart still explains the original trained model's feature drivers.""")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1505,6 +1550,7 @@ elif page == pages[9]:
 
     with tab_upload:
         st.markdown("**Upload CSV for instant prediction, risk score, and recommendation**")
+        st.caption("Predicted Price is the calibrated Indian market estimate. Original Model Price keeps the raw CatBoost output for transparency.")
         st.caption("Accepted columns include original model names or simple aliases like bedrooms, bathrooms, area, grade, condition, property_age, pincode, and infrastructure_score.")
         uploaded = st.file_uploader("Upload property CSV", type=["csv"])
         if uploaded is not None:
@@ -1512,6 +1558,8 @@ elif page == pages[9]:
                 upload_df = pd.read_csv(uploaded)
                 scored_upload, missing_features = score_uploaded_properties(upload_df)
                 display_upload = scored_upload.copy()
+                display_upload["Original Model Price"] = display_upload["Original Model Price"].apply(fmt_inr)
+                display_upload["Market Calibration"] = display_upload["Market Calibration"].map(lambda v: f"{v:.1f}x")
                 display_upload["Predicted Price"] = display_upload["Predicted Price"].apply(fmt_inr)
                 display_upload["Risk Score"] = display_upload["Risk Score"].map(lambda v: f"{v:.1f}")
                 display_upload["Investment Score"] = display_upload["Investment Score"].map(lambda v: f"{v:.1f}")
